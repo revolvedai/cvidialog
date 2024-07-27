@@ -1,6 +1,43 @@
+import os
+import subprocess
+import warnings
+import sys
+from importlib.metadata import version, PackageNotFoundError
+
+# Function to install missing packages
+def install_packages():
+    required = ['gradio==3.0.0', 'torch==2.0.1', 'transformers==4.28.1', 'huggingface_hub==0.13.4']
+    missing = []
+
+    for package in required:
+        try:
+            pkg_name = package.split('==')[0]
+            version(pkg_name)
+        except PackageNotFoundError:
+            missing.append(package)
+
+    if missing:
+        print(f"Missing packages: {missing}")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", *missing])
+
+    # Install repeng from GitHub
+    try:
+        import repeng
+        print("repeng is already installed.")
+    except ImportError:
+        print("repeng not found. Installing...")
+        subprocess.check_call(["pip", "install", "git+https://github.com/vgel/repeng.git"])
+        print("repeng installed successfully.")
+
+# Install missing packages
+install_packages()
+
 import gradio as gr
 import json
 import torch
+
+# Suppress flash attention warning if not compiled with it
+warnings.filterwarnings("ignore", category=UserWarning, message=".*flash attention.*")
 
 print(f"CUDA available: {torch.cuda.is_available()}")
 print(f"Current device: {torch.cuda.current_device()}")
@@ -8,7 +45,6 @@ print(f"Device name: {torch.cuda.get_device_name(0)}")
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from repeng import ControlVector, ControlModel, DatasetEntry
-import os
 from huggingface_hub import hf_hub_download, snapshot_download
 import time
 import torch.nn.functional as F

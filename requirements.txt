@@ -1,0 +1,5 @@
+gradio==3.0.0
+torch==2.0.1
+transformers==4.28.1
+huggingface_hub==0.13.4
+git+https://github.com/vgel/repeng.git
