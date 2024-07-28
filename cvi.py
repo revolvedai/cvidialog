@@ -6,7 +6,7 @@ from importlib.metadata import version, PackageNotFoundError
 
 # Function to install missing packages
 def install_packages():
-    required = ['gradio==3.0.0', 'torch==2.0.1', 'transformers==4.28.1', 'huggingface_hub==0.13.4']
+    required = ['gradio', 'torch==2.0.1', 'transformers==4.28.1', 'huggingface_hub==0.13.4']
     missing = []
 
     for package in required:
