@@ -122,9 +122,6 @@ def load_model(model_name=None):
     print("Model loading complete")
     return "Model loaded successfully"
 
-# Load the model at startup
-load_model()
-
 def generate_text(prompt, max_new_tokens=512, temperature=0.9, top_p=0.95, top_k=50, repetition_penalty=1.0):
     global model, tokenizer, user_tag, asst_tag
 
