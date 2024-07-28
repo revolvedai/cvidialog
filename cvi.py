@@ -60,11 +60,14 @@ def load_config():
     with open('config.json', 'r') as f:
         return json.load(f)
 
-def load_config():
-    with open('config.json', 'r') as f:
-        return json.load(f)
+def is_model_downloaded(model_name):
+    cache_dir = os.path.join(os.getcwd(), "model_cache", model_name)
+    return os.path.exists(cache_dir) and os.path.isdir(cache_dir) and os.listdir(cache_dir)
 
 def download_model(model_name, hf_token):
+    if is_model_downloaded(model_name):
+        print(f"Model {model_name} is already downloaded.")
+        return
     print(f"Downloading model: {model_name}")
     cache_dir = os.path.join(os.getcwd(), "model_cache")
     os.makedirs(cache_dir, exist_ok=True)
@@ -90,7 +93,7 @@ def load_model(model_name=None):
 
     print(f"Preparing to load model: {model_name}")
 
-    # First, ensure the model is downloaded
+    # Ensure the model is downloaded
     download_model(model_name, hf_token)
 
     cache_dir = os.path.join(os.getcwd(), "model_cache")
@@ -121,6 +124,9 @@ def load_model(model_name=None):
 
     print("Model loading complete")
     return "Model loaded successfully"
+
+config = load_config()
+load_model(config['model_name'])
 
 def generate_text(prompt, max_new_tokens=512, temperature=0.9, top_p=0.95, top_k=50, repetition_penalty=1.0):
     global model, tokenizer, user_tag, asst_tag
