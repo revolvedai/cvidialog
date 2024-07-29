@@ -1,4 +1,4 @@
-gradio
+gradio=4.39.0
 torch==2.0.1
 transformers==4.28.1
 huggingface_hub==0.13.4

@@ -23,7 +23,7 @@ def install_packages():
     # Install repeng from GitHub
     try:
         import repeng
-        print("repeng is already installed.")
+        print("repeng is ready to go.")
     except ImportError:
         print("repeng not found. Installing...")
         subprocess.check_call(["pip", "install", "git+https://github.com/vgel/repeng.git"])
@@ -188,8 +188,6 @@ def chat(message, history, temperature, top_p, top_k, max_new_tokens, repetition
 def clear_chat():
     return []
 
-# Placeholder functions (to be implemented later)
-
 def retry(history, temperature, top_p, top_k, max_new_tokens, repetition_penalty):
     if not history:
         return history
@@ -237,10 +235,60 @@ def undo(history):
         history.pop()
     return history
 
+# Global variable to store prompts
+saved_prompts_dict = {}
+
+def load_prompts_from_file():
+    global saved_prompts_dict
+    saved_prompts_dict.clear()  # Clear existing prompts
+    try:
+        with open('savedprompts.txt', 'r') as f:
+            for line in f:
+                name, prompt = line.strip().split(':', 1)
+                saved_prompts_dict[name] = prompt
+    except FileNotFoundError:
+        print("No saved prompts file found. Starting with an empty prompt list.")
+    return list(saved_prompts_dict.keys())
+
+def save_prompt_to_file(name, prompt):
+    with open('savedprompts.txt', 'a') as f:
+        f.write(f"{name}:{prompt}\n")
+
 def save_prompt(prompt_name, prompt):
-    return f"Prompt '{prompt_name}' saved: {prompt}"
+    if prompt_name and prompt:
+        saved_prompts_dict[prompt_name] = prompt
+        save_prompt_to_file(prompt_name, prompt)
+        return gr.Dropdown(choices=list(saved_prompts_dict.keys()), value=prompt_name)
+    return gr.Dropdown(choices=list(saved_prompts_dict.keys()))
 
+def load_prompt(prompt_name):
+    return saved_prompts_dict.get(prompt_name, "")
 
+def refresh_prompts():
+    prompt_list = load_prompts_from_file()
+    return gr.Dropdown(choices=prompt_list)
+
+# Load prompts at the start of the application
+load_prompts_from_file()
+
+def load_files_from_train_folder():
+    train_folder = os.path.join(os.getcwd(), "train")
+    try:
+        files = [f for f in os.listdir(train_folder) if os.path.isfile(os.path.join(train_folder, f))]
+        return files
+    except Exception as e:
+        print(f"Error loading files: {e}")
+        return []
+
+def refresh_file_list():
+    files = load_files_from_train_folder()
+    return {"choices": files, "__type__": "update"}, {"choices": files, "__type__": "update"}
+
+def load_file_content(file_name):
+    train_folder = os.path.join(os.getcwd(), "train")
+    file_path = os.path.join(train_folder, file_name)
+    with open(file_path, 'r') as f:
+        return f.read()  # Read as plain text instead of JSON
 def make_dataset(prefix_list, suffix_list, positive_persona, negative_persona):
     return f"Dataset created with prefix: {prefix_list}, suffix: {suffix_list}, positive: {positive_persona}, negative: {negative_persona}"
 
@@ -283,7 +331,12 @@ with gr.Blocks(css=css) as demo:  # Remove js=js_code from here
 
     with gr.Tabs():
         with gr.TabItem("Chat"):
-            chatbot = gr.Chatbot(label="Dialog", bubble_full_width=False, show_copy_button=True)
+            chatbot = gr.Chatbot(
+                label="Dialog",
+                bubble_full_width=False,
+                show_copy_button=True,
+                height=480
+            )
             msg = gr.Textbox(label="Type a message...", lines=1)
 
             with gr.Row():
@@ -294,8 +347,10 @@ with gr.Blocks(css=css) as demo:  # Remove js=js_code from here
                     undo_button = gr.Button("Undo")
                 with gr.Column(scale=3):
                     prompt_name = gr.Textbox(label="Prompt Name", lines=1)
-                    save_prompt_button = gr.Button("Save Prompt")
-                    prompts_dropdown = gr.Dropdown(choices=saved_prompts, label="Prompt Select")
+                    prompts_dropdown = gr.Dropdown(choices=list(saved_prompts_dict.keys()), label="Prompt Select")
+                    with gr.Row():
+                        save_prompt_button = gr.Button("Save Prompt")
+                        refresh_button = gr.Button("⟳", size="sm")
 
             with gr.Row():
                 control_vector = gr.Dropdown(choices=control_vector_options, label="Control Vector", value="None", scale=3)
@@ -323,13 +378,35 @@ with gr.Blocks(css=css) as demo:  # Remove js=js_code from here
             )
             undo_button.click(undo, inputs=[chatbot], outputs=[chatbot])
             clear_button.click(clear_chat, outputs=[chatbot])
-            save_prompt_button.click(save_prompt, inputs=[prompt_name, msg], outputs=[prompts_dropdown])
+
+            save_prompt_button.click(
+                save_prompt,
+                inputs=[prompt_name, msg],
+                outputs=[prompts_dropdown]
+            )
+
+            prompts_dropdown.change(
+                load_prompt,
+                inputs=[prompts_dropdown],
+                outputs=[msg]
+            )
+
+            refresh_button.click(
+                refresh_prompts,
+                outputs=[prompts_dropdown]
+            )
 
         with gr.TabItem("Train"):
             gr.Markdown("## Dataset Creation")
             with gr.Row():
-                prefix_list = gr.Dropdown(choices=prefix_options, label="Prefix List")
-                suffix_list = gr.Dropdown(choices=suffix_options, label="Suffix List")
+                with gr.Column(scale=10):
+                    prefix_list = gr.Dropdown(choices=load_files_from_train_folder(), label="Prefix List",
+                                              allow_custom_value=True)
+                with gr.Column(scale=10):
+                    suffix_list = gr.Dropdown(choices=load_files_from_train_folder(), label="Suffix List",
+                                              allow_custom_value=True)
+                with gr.Column(scale=1, min_width=50):
+                    refresh_button = gr.Button("⟳", size="sm")
             with gr.Row():
                 positive_persona = gr.Textbox(label="Positive Persona")
                 negative_persona = gr.Textbox(label="Negative Persona")
@@ -355,6 +432,11 @@ with gr.Blocks(css=css) as demo:  # Remove js=js_code from here
                 train_vector,
                 inputs=[vector_name, default_strength, dataset_info],
                 outputs=[training_info]
+            )
+
+            refresh_button.click(
+                refresh_file_list,
+                outputs=[prefix_list, suffix_list]
             )
 
 demo.queue()
