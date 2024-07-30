@@ -1,24 +1,20 @@
-import os
-import subprocess
-import warnings
-import sys
-from importlib.metadata import version, PackageNotFoundError
-
 # Function to install missing packages
 def install_packages():
-    required = ['gradio', 'torch==2.0.1', 'transformers==4.28.1', 'huggingface_hub==0.13.4']
+    required = ['gradio==4.39.0', 'torch==2.0.1', 'transformers==4.28.1', 'huggingface_hub==0.13.4']
     missing = []
 
     for package in required:
         try:
-            pkg_name = package.split('==')[0]
-            version(pkg_name)
+            pkg_name, pkg_version = package.split('==')
+            installed_version = version(pkg_name)
+            if installed_version != pkg_version:
+                missing.append(package)
         except PackageNotFoundError:
             missing.append(package)
 
     if missing:
-        print(f"Missing packages: {missing}")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", *missing])
+        print(f"Installing or updating packages: {missing}")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", *missing])
 
     # Install repeng from GitHub
     try:
@@ -26,7 +22,7 @@ def install_packages():
         print("repeng is ready to go.")
     except ImportError:
         print("repeng not found. Installing...")
-        subprocess.check_call(["pip", "install", "git+https://github.com/vgel/repeng.git"])
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "git+https://github.com/vgel/repeng.git"])
         print("repeng installed successfully.")
 
 # Install missing packages
@@ -55,6 +51,8 @@ model = None
 tokenizer = None
 user_tag = None
 asst_tag = None
+saved_prompts_dict = {}
+control_vector_options = []
 
 def load_config():
     with open('config.json', 'r') as f:
@@ -229,14 +227,10 @@ def retry(history, temperature, top_p, top_k, max_new_tokens, repetition_penalty
 
     return new_history
 
-
 def undo(history):
     if history:
         history.pop()
     return history
-
-# Global variable to store prompts
-saved_prompts_dict = {}
 
 def load_prompts_from_file():
     global saved_prompts_dict
@@ -262,14 +256,36 @@ def save_prompt(prompt_name, prompt):
     return gr.Dropdown(choices=list(saved_prompts_dict.keys()))
 
 def load_prompt(prompt_name):
-    return saved_prompts_dict.get(prompt_name, "")
+    prompt = saved_prompts_dict.get(prompt_name, "")
+    return {"value": prompt, "__type__": "update"}
+
+# Load prompts at the start of the application
+load_prompts_from_file()
 
 def refresh_prompts():
     prompt_list = load_prompts_from_file()
     return gr.Dropdown(choices=prompt_list)
 
-# Load prompts at the start of the application
-load_prompts_from_file()
+def load_control_vectors_from_folder():
+    cv_folder = os.path.join(os.getcwd(), "cv")
+    try:
+        if not os.path.exists(cv_folder):
+            os.makedirs(cv_folder)
+            print(f"Created 'cv' folder at {cv_folder}")
+        control_vector_options = ["None"] + [f for f in os.listdir(cv_folder) if os.path.isfile(os.path.join(cv_folder, f))]
+        print(f"Control Vectors found: {control_vector_options}")
+        return control_vector_options
+    except Exception as e:
+        print(f"Error loading Control Vectors: {e}")
+        return ["None"]
+
+def refresh_control_vectors():
+    options = load_control_vectors_from_folder()
+    print(f"Refreshed control vectors: {options}")
+    return gr.Dropdown(choices=options, value="None", interactive=True)
+
+control_vector_options = load_control_vectors_from_folder()
+load_control_vectors_from_folder()
 
 def load_files_from_train_folder():
     train_folder = os.path.join(os.getcwd(), "train")
@@ -292,19 +308,13 @@ def load_file_content(file_name):
 def make_dataset(prefix_list, suffix_list, positive_persona, negative_persona):
     return f"Dataset created with prefix: {prefix_list}, suffix: {suffix_list}, positive: {positive_persona}, negative: {negative_persona}"
 
-
 def train_vector(vector_name, default_strength, dataset_info, progress=gr.Progress()):
     for i in range(100):
         progress(i / 100, desc="Training")
     return f"Vector '{vector_name}' trained with default strength {default_strength}. Dataset: {dataset_info}"
 
-
 # Available models and other options
 model_options = ["mistralai/Mistral-7B-Instruct-v0.1", "meta-llama/Llama-2-7b-chat-hf", "ggml model (upload .bin file)"]
-control_vector_options = ["None", "Creative", "Formal", "Casual"]
-prefix_options = ["Prefix List 1", "Prefix List 2", "Prefix List 3"]
-suffix_options = ["Suffix List 1", "Suffix List 2", "Suffix List 3"]
-saved_prompts = ["Prompt 1", "Prompt 2", "Prompt 3"]
 
 # Custom CSS
 css = """
@@ -353,9 +363,13 @@ with gr.Blocks(css=css) as demo:  # Remove js=js_code from here
                         refresh_button = gr.Button("⟳", size="sm")
 
             with gr.Row():
-                control_vector = gr.Dropdown(choices=control_vector_options, label="Control Vector", value="None", scale=3)
-                vector_strength = gr.Slider(minimum=-5, maximum=5, value=0, step=0.1, label="Vector Strength", scale=2)
-                add_button = gr.Button("Add", size="sm")
+                with gr.Column(scale=3):
+                    control_vector = gr.Dropdown(choices=control_vector_options, label="Control Vector", value="None",
+                                                 interactive=True)
+                with gr.Column(scale=2):
+                    vector_strength = gr.Slider(minimum=-5, maximum=5, value=0, step=0.1, label="Vector Strength")
+                with gr.Column(scale=1, min_width=50):
+                    cv_refresh_button = gr.Button("⟳", size="sm")
 
             with gr.Row():
                 with gr.Column(scale=1):
@@ -395,15 +409,19 @@ with gr.Blocks(css=css) as demo:  # Remove js=js_code from here
                 refresh_prompts,
                 outputs=[prompts_dropdown]
             )
+            cv_refresh_button.click(
+                refresh_control_vectors,
+                outputs=[control_vector]
+            )
 
         with gr.TabItem("Train"):
             gr.Markdown("## Dataset Creation")
             with gr.Row():
                 with gr.Column(scale=10):
-                    prefix_list = gr.Dropdown(choices=load_files_from_train_folder(), label="Prefix List",
+                    prefix_list = gr.Dropdown(choices=load_files_from_train_folder(), label="Truncated Outputs",
                                               allow_custom_value=True)
                 with gr.Column(scale=10):
-                    suffix_list = gr.Dropdown(choices=load_files_from_train_folder(), label="Suffix List",
+                    suffix_list = gr.Dropdown(choices=load_files_from_train_folder(), label="True Facts",
                                               allow_custom_value=True)
                 with gr.Column(scale=1, min_width=50):
                     refresh_button = gr.Button("⟳", size="sm")
