@@ -1,13 +1,33 @@
+import os
+import subprocess
+import warnings
+import sys
+from importlib.metadata import version, PackageNotFoundError
+
 # Function to install missing packages
 def install_packages():
-    required = ['gradio==4.39.0', 'torch==2.0.1', 'transformers==4.28.1', 'huggingface_hub==0.13.4']
+    required = [
+        'gradio==4.39.0',
+        'torch==2.0.1',
+        'transformers>=4.30.0,<5.0.0',
+        'huggingface_hub>=0.14.1',
+        'tokenizers>=0.13.3'
+    ]
     missing = []
 
     for package in required:
         try:
-            pkg_name, pkg_version = package.split('==')
+            if '>=' in package:
+                pkg_name, pkg_version = package.split('>=')
+                pkg_version = pkg_version.split(',')[0]  # Take the lower bound for checking
+            else:
+                pkg_name, pkg_version = package.split('==')
+
             installed_version = version(pkg_name)
-            if installed_version != pkg_version:
+            if '>=' in package:
+                if installed_version < pkg_version:
+                    missing.append(package)
+            elif installed_version != pkg_version:
                 missing.append(package)
         except PackageNotFoundError:
             missing.append(package)
@@ -22,7 +42,8 @@ def install_packages():
         print("repeng is ready to go.")
     except ImportError:
         print("repeng not found. Installing...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "git+https://github.com/vgel/repeng.git"])
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--upgrade", "git+https://github.com/vgel/repeng.git"])
         print("repeng installed successfully.")
 
 # Install missing packages
