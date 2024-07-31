@@ -3,12 +3,16 @@ import subprocess
 import warnings
 import sys
 from importlib.metadata import version, PackageNotFoundError
+from typing import List, Dict
+import logging
+from datetime import datetime
+
 
 # Function to install missing packages
 def install_packages():
     required = [
         'gradio==4.39.0',
-        'torch==2.0.1',
+        'torch==2.4.0',
         'transformers>=4.30.0,<5.0.0',
         'huggingface_hub>=0.14.1',
         'tokenizers>=0.13.3'
@@ -46,6 +50,7 @@ def install_packages():
             [sys.executable, "-m", "pip", "install", "--upgrade", "git+https://github.com/vgel/repeng.git"])
         print("repeng installed successfully.")
 
+
 # Install missing packages
 install_packages()
 
@@ -62,6 +67,7 @@ print(f"Device name: {torch.cuda.get_device_name(0)}")
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from repeng import ControlVector, ControlModel, DatasetEntry
+import pickle
 from huggingface_hub import hf_hub_download, snapshot_download
 import time
 import torch.nn.functional as F
@@ -75,13 +81,20 @@ asst_tag = None
 saved_prompts_dict = {}
 control_vector_options = []
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+
+def log_info(message):
+    logging.info(message)
+
 def load_config():
     with open('config.json', 'r') as f:
         return json.load(f)
 
+
 def is_model_downloaded(model_name):
     cache_dir = os.path.join(os.getcwd(), "model_cache", model_name)
     return os.path.exists(cache_dir) and os.path.isdir(cache_dir) and os.listdir(cache_dir)
+
 
 def download_model(model_name, hf_token):
     if is_model_downloaded(model_name):
@@ -102,6 +115,7 @@ def download_model(model_name, hf_token):
     except Exception as e:
         print(f"Error downloading model: {e}")
         raise
+
 
 def load_model(model_name=None):
     global model, tokenizer, user_tag, asst_tag
@@ -144,53 +158,88 @@ def load_model(model_name=None):
     print("Model loading complete")
     return "Model loaded successfully"
 
+
 config = load_config()
 load_model(config['model_name'])
+
 
 def generate_text(prompt, max_new_tokens=512, temperature=0.9, top_p=0.95, top_k=50, repetition_penalty=1.0):
     global model, tokenizer, user_tag, asst_tag
 
-    # Input validation
-    temperature = max(0.01, min(3.0, temperature))
-    if abs(temperature - 2.0) < 1e-6:
-        temperature += 1e-6
-    top_p = max(0.0, min(1.0, top_p))
-    top_k = max(1, int(top_k))
-    repetition_penalty = max(1.0, repetition_penalty)
-    max_new_tokens = min(int(max_new_tokens), 8192)
+    # Parse control vectors
+    clean_prompt, vectors = parse_control_vectors(prompt)
 
-    input_ids = tokenizer.encode(f"{user_tag} {prompt} {asst_tag}", return_tensors="pt").to(model.device)
+    log_info(f"Chat Request. Prompt: {clean_prompt[:50]}...")  # Log first 50 chars of prompt
+
+    input_ids = tokenizer.encode(f"{user_tag} {clean_prompt} {asst_tag}", return_tensors="pt").to(model.device)
 
     try:
-        with torch.no_grad():
-            output = model.generate(
-                input_ids,
-                max_new_tokens=max_new_tokens,
-                do_sample=True,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                repetition_penalty=repetition_penalty,
-                pad_token_id=tokenizer.pad_token_id,
-            )
+        if vectors:
+            outputs = []
+            for vector_name, strength in vectors:
+                vector_path = os.path.join(os.getcwd(), "cv", f"{vector_name}.pt")
+                if not os.path.exists(vector_path):
+                    log_info(f"Warning: Control Vector {vector_name} not found.")
+                    continue
 
-        generated_text = tokenizer.decode(output[0], skip_special_tokens=True)
+                log_info(f"Using Control Vector '{vector_name}' at strength {strength} for reply")
 
-        parts = generated_text.split(asst_tag)
-        if len(parts) > 1:
-            return parts[-1].strip()
+                vector = load_control_vector(vector_path)
+                if vector is None:
+                    log_info(f"Failed to load Control Vector {vector_name}. Skipping.")
+                    continue
+
+                model.set_control(vector, strength)
+
+                with torch.no_grad():
+                    output = model.generate(
+                        input_ids,
+                        max_new_tokens=max_new_tokens,
+                        do_sample=True,
+                        temperature=temperature,
+                        top_p=top_p,
+                        top_k=top_k,
+                        repetition_penalty=repetition_penalty,
+                        pad_token_id=tokenizer.pad_token_id,
+                    )
+                outputs.append(output)
+                model.reset()
+                log_info(f"Generated output with Control Vector '{vector_name}'")
+
+            # Combine outputs
+            combined_output = torch.cat(outputs, dim=0)
+            generated_text = tokenizer.decode(combined_output[0], skip_special_tokens=True)
         else:
-            return generated_text.strip()
+            # Generate without Control Vectors
+            with torch.no_grad():
+                output = model.generate(
+                    input_ids,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=True,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    repetition_penalty=repetition_penalty,
+                    pad_token_id=tokenizer.pad_token_id,
+                )
+            generated_text = tokenizer.decode(output[0], skip_special_tokens=True)
+
+        # Extract the assistant's response
+        response = generated_text.split(asst_tag)[-1].strip()
+        log_info(f"Generated response: {response[:50]}...")  # Log first 50 chars of response
+        return response
 
     except Exception as e:
-        print(f"Error in generate_text: {e}")
+        log_info(f"Error in generate_text: {e}")
         return f"An error occurred: {e}"
-
 def chat(message, history, temperature, top_p, top_k, max_new_tokens, repetition_penalty):
     global model, tokenizer
 
     if model is None or tokenizer is None:
+        log_info("Model not loaded. Please load a model first.")
         return "", history + [("Model not loaded. Please load a model first.", None)]
+
+    log_info(f"Received chat message: {message[:50]}...")  # Log first 50 chars of message
 
     full_prompt = "\n".join([f"Human: {h[0]}\nAI: {h[1]}" for h in history])
     full_prompt += f"\nHuman: {message}\nAI:"
@@ -198,12 +247,16 @@ def chat(message, history, temperature, top_p, top_k, max_new_tokens, repetition
     try:
         bot_message = generate_text(full_prompt, max_new_tokens=max_new_tokens, temperature=temperature, top_p=top_p,
                                     top_k=top_k, repetition_penalty=repetition_penalty)
-        history.append((message, bot_message))
+        log_info(f"Generated bot message: {bot_message[:50]}...")  # Log first 50 chars of bot message
+        new_history = history + [(message, bot_message)]
+        log_info("Chat response generated successfully")
+        return "", new_history
     except Exception as e:
+        log_info(f"Error in chat function: {e}")
         bot_message = f"An error occurred: {e}"
-        history.append((message, bot_message))
+        new_history = history + [(message, bot_message)]
+        return "", new_history
 
-    return "", history
 def clear_chat():
     return []
 
@@ -248,6 +301,7 @@ def retry(history, temperature, top_p, top_k, max_new_tokens, repetition_penalty
 
     return new_history
 
+
 def undo(history):
     if history:
         history.pop()
@@ -283,9 +337,11 @@ def load_prompt(prompt_name):
 # Load prompts at the start of the application
 load_prompts_from_file()
 
+
 def refresh_prompts():
     prompt_list = load_prompts_from_file()
     return gr.Dropdown(choices=prompt_list)
+
 
 def load_control_vectors_from_folder():
     cv_folder = os.path.join(os.getcwd(), "cv")
@@ -293,46 +349,259 @@ def load_control_vectors_from_folder():
         if not os.path.exists(cv_folder):
             os.makedirs(cv_folder)
             print(f"Created 'cv' folder at {cv_folder}")
-        control_vector_options = ["None"] + [f for f in os.listdir(cv_folder) if os.path.isfile(os.path.join(cv_folder, f))]
+        control_vector_options = ["None"] + [
+            f for f in os.listdir(cv_folder)
+            if f.endswith('.pt') and not f.endswith('_metadata.json')
+        ]
         print(f"Control Vectors found: {control_vector_options}")
         return control_vector_options
     except Exception as e:
         print(f"Error loading Control Vectors: {e}")
         return ["None"]
 
+
 def refresh_control_vectors():
     options = load_control_vectors_from_folder()
     print(f"Refreshed control vectors: {options}")
-    return gr.Dropdown(choices=options, value="None", interactive=True)
+    return gr.Dropdown(choices=options, value="None", interactive=True, allow_custom_value=True)
+
 
 control_vector_options = load_control_vectors_from_folder()
-load_control_vectors_from_folder()
+
+
+def add_control_vector_to_input(control_vector, vector_strength, current_input):
+    if control_vector == "None":
+        return current_input
+    cv_name = control_vector.rsplit('.', 1)[0]  # Remove file extension if present
+    cv_text = f"<{cv_name}:{vector_strength}>"
+    log_info(f"Added Control Vector to input: {cv_text}")
+    return current_input + " " + cv_text if current_input else cv_text
+
+
+def parse_control_vectors(input_text):
+    import re
+    pattern = r'<(\w+):(-?\d+(?:\.\d+)?)>'
+    matches = re.findall(pattern, input_text)
+    vectors = [(name, float(strength)) for name, strength in matches]
+    clean_text = re.sub(pattern, '', input_text).strip()
+    return clean_text, vectors
+
 
 def load_files_from_train_folder():
     train_folder = os.path.join(os.getcwd(), "train")
     try:
         files = [f for f in os.listdir(train_folder) if os.path.isfile(os.path.join(train_folder, f))]
-        return files
+        return ["None"] + files  # Add "None" as the first option
     except Exception as e:
         print(f"Error loading files: {e}")
-        return []
+        return ["None"]  # Return ["None"] if there's an error
+
 
 def refresh_file_list():
     files = load_files_from_train_folder()
     return {"choices": files, "__type__": "update"}, {"choices": files, "__type__": "update"}
 
-def load_file_content(file_name):
+
+def load_file_content(file_name: str) -> List[str]:
+    if file_name == "None":
+        return []
     train_folder = os.path.join(os.getcwd(), "train")
     file_path = os.path.join(train_folder, file_name)
     with open(file_path, 'r') as f:
-        return f.read()  # Read as plain text instead of JSON
-def make_dataset(prefix_list, suffix_list, positive_persona, negative_persona):
-    return f"Dataset created with prefix: {prefix_list}, suffix: {suffix_list}, positive: {positive_persona}, negative: {negative_persona}"
+        return json.load(f)
 
-def train_vector(vector_name, default_strength, dataset_info, progress=gr.Progress()):
-    for i in range(100):
-        progress(i / 100, desc="Training")
-    return f"Vector '{vector_name}' trained with default strength {default_strength}. Dataset: {dataset_info}"
+
+def make_dataset(
+        truncated_outputs: str,
+        true_facts: str,
+        positive_persona: str,
+        negative_persona: str,
+        user_tag: str,
+        asst_tag: str,
+        tokenizer: AutoTokenizer
+) -> Dict[str, List[Dict[str, str]]]:
+    # Load truncated outputs and true facts
+    output_suffixes = load_file_content(truncated_outputs)
+    fact_suffixes = load_file_content(true_facts)
+
+    # Tokenize and truncate outputs
+    truncated_output_suffixes = [
+        tokenizer.convert_tokens_to_string(tokens[:i])
+        for tokens in (tokenizer.tokenize(s) for s in output_suffixes)
+        for i in range(1, len(tokens))
+    ]
+
+    # Tokenize and truncate facts
+    truncated_fact_suffixes = [
+        tokenizer.convert_tokens_to_string(tokens[:i])
+        for tokens in (tokenizer.tokenize(s) for s in fact_suffixes)
+        for i in range(1, len(tokens) - 5)
+    ]
+
+    # Combine truncated outputs and facts
+    all_suffixes = truncated_output_suffixes + truncated_fact_suffixes
+
+    # Create dataset entries
+    dataset = []
+    for suffix in all_suffixes:
+        positive_entry = f"{user_tag} {positive_persona} {asst_tag} {suffix}"
+        negative_entry = f"{user_tag} {negative_persona} {asst_tag} {suffix}"
+        dataset.append({
+            "positive": positive_entry,
+            "negative": negative_entry
+        })
+
+    return {"dataset": dataset}
+
+
+def save_dataset(dataset: Dict[str, List[Dict[str, str]]], dataset_name: str):
+    dataset_folder = os.path.join(os.getcwd(), "dataset")
+    os.makedirs(dataset_folder, exist_ok=True)
+    file_path = os.path.join(dataset_folder, f"{dataset_name}.json")
+
+    with open(file_path, 'w') as f:
+        json.dump(dataset, f, indent=2)
+
+    return file_path
+
+
+# Update the existing make_dataset function to use the new implementation
+def make_dataset_ui(truncated_outputs, true_facts, positive_persona, negative_persona):
+    global tokenizer, user_tag, asst_tag
+
+    if not all([truncated_outputs, true_facts, positive_persona, negative_persona]):
+        return "Please fill in all fields."
+
+    if truncated_outputs == "None" or true_facts == "None":
+        return "Please select valid files for Truncated Outputs and True Facts."
+
+    dataset = make_dataset(
+        truncated_outputs,
+        true_facts,
+        positive_persona,
+        negative_persona,
+        user_tag,
+        asst_tag,
+        tokenizer
+    )
+
+    # Generate a unique name for the dataset using the new function
+    dataset_name = generate_dataset_name(positive_persona, negative_persona)
+
+    file_path = save_dataset(dataset, dataset_name)
+    response_count = len(dataset["dataset"])
+
+    return f"Dataset '{dataset_name}' created successfully with {response_count} positive/negative pairs. Saved to {file_path}"
+
+
+def generate_dataset_name(positive_persona: str, negative_persona: str) -> str:
+    # Clean and truncate personas to create a valid filename
+    def clean_name(name: str) -> str:
+        return ''.join(c for c in name if c.isalnum() or c in [' ', '_']).rstrip()
+
+    pos = clean_name(positive_persona)[:20]  # Limit to 20 characters
+    neg = clean_name(negative_persona)[:20]
+    base_name = f"{pos}_vs_{neg}_data"
+
+    # Check if the name already exists and add version number if needed
+    dataset_folder = os.path.join(os.getcwd(), "dataset")
+    version = 1
+    new_name = base_name
+    while os.path.exists(os.path.join(dataset_folder, f"{new_name}.json")):
+        version += 1
+        new_name = f"{base_name}_v{version}"
+
+    return new_name
+
+
+def load_datasets_from_folder():
+    dataset_folder = os.path.join(os.getcwd(), "dataset")
+    try:
+        if not os.path.exists(dataset_folder):
+            os.makedirs(dataset_folder)
+            print(f"Created 'dataset' folder at {dataset_folder}")
+
+        files = ["None"] + [f for f in os.listdir(dataset_folder) if f.endswith('.json')]
+        print(f"Datasets found: {files}")
+        return files
+    except Exception as e:
+        print(f"Error loading datasets: {e}")
+        return ["None"]
+
+
+def train_vector(vector_name, dataset_file, default_strength, progress=gr.Progress()):
+    global model, tokenizer
+
+    if not vector_name:
+        return "Please enter a Control Vector Name."
+
+    if dataset_file == "None":
+        return "Please select a dataset for training."
+
+    # Load the dataset
+    dataset_folder = os.path.join(os.getcwd(), "dataset")
+    dataset_path = os.path.join(dataset_folder, dataset_file)
+
+    try:
+        with open(dataset_path, 'r') as f:
+            dataset_json = json.load(f)
+    except Exception as e:
+        return f"Error loading dataset: {e}"
+
+    # Convert the loaded JSON data to DatasetEntry objects
+    dataset = [DatasetEntry(positive=entry["positive"], negative=entry["negative"])
+               for entry in dataset_json["dataset"]]
+
+    # Reset the model before training
+    model.reset()
+
+    # Train the control vector
+    try:
+        progress(0, desc="Training Control Vector")
+        control_vector = ControlVector.train(model, tokenizer, dataset)
+        progress(1, desc="Training Complete")
+    except Exception as e:
+        return f"Error during training: {e}"
+
+        # Save the trained vector
+    cv_folder = os.path.join(os.getcwd(), "cv")
+    os.makedirs(cv_folder, exist_ok=True)
+    vector_path = os.path.join(cv_folder, f"{vector_name}.pt")
+
+    try:
+        save_control_vector(control_vector, vector_path)
+    except Exception as e:
+        return f"Error saving control vector: {e}"
+
+    # Save metadata
+    metadata_path = os.path.join(cv_folder, f"{vector_name}_metadata.json")
+    metadata = {
+        "name": vector_name,
+        "default_strength": default_strength,
+        "dataset": dataset_file
+    }
+
+    with open(metadata_path, 'w') as f:
+        json.dump(metadata, f, indent=2)
+
+    return f"Vector '{vector_name}' trained successfully using dataset '{dataset_file}'. Saved to {vector_path}"
+
+def save_control_vector(vector, path):
+    with open(path, 'wb') as f:
+        pickle.dump(vector, f)
+    log_info(f"Saved Control Vector to {path}")
+
+def load_control_vector(path):
+    try:
+        with open(path, 'rb') as f:
+            vector = pickle.load(f)
+        if not isinstance(vector, ControlVector):
+            raise TypeError(f"Loaded object is not a ControlVector: {type(vector)}")
+        log_info(f"Loaded Control Vector from {path}")
+        return vector
+    except Exception as e:
+        log_info(f"Error loading Control Vector from {path}: {e}")
+        return None
 
 # Available models and other options
 model_options = ["mistralai/Mistral-7B-Instruct-v0.1", "meta-llama/Llama-2-7b-chat-hf", "ggml model (upload .bin file)"]
@@ -353,7 +622,7 @@ css = """
 """
 
 # Create the Gradio interface
-with gr.Blocks(css=css) as demo:  # Remove js=js_code from here
+with gr.Blocks(css=css) as demo:
     gr.Markdown("# Control Vector Interface")
 
     with gr.Row():
@@ -368,7 +637,7 @@ with gr.Blocks(css=css) as demo:  # Remove js=js_code from here
                 show_copy_button=True,
                 height=480
             )
-            msg = gr.Textbox(label="Type a message...", lines=1)
+            msg = gr.Textbox(label="Type a message...", lines=1, interactive=True)
 
             with gr.Row():
                 with gr.Column(scale=2):
@@ -385,11 +654,17 @@ with gr.Blocks(css=css) as demo:  # Remove js=js_code from here
 
             with gr.Row():
                 with gr.Column(scale=3):
-                    control_vector = gr.Dropdown(choices=control_vector_options, label="Control Vector", value="None",
-                                                 interactive=True)
+                    control_vector = gr.Dropdown(
+                        choices=control_vector_options,
+                        label="Control Vector",
+                        value="None",
+                        interactive=True,
+                        allow_custom_value=True
+                    )
                 with gr.Column(scale=2):
                     vector_strength = gr.Slider(minimum=-5, maximum=5, value=0, step=0.1, label="Vector Strength")
                 with gr.Column(scale=1, min_width=50):
+                    add_cv_button = gr.Button("Add", size="sm")
                     cv_refresh_button = gr.Button("⟳", size="sm")
 
             with gr.Row():
@@ -435,15 +710,17 @@ with gr.Blocks(css=css) as demo:  # Remove js=js_code from here
                 outputs=[control_vector]
             )
 
+            add_cv_button.click(add_control_vector_to_input, inputs=[control_vector, vector_strength, msg],
+                                outputs=[msg]
+                                )
+
         with gr.TabItem("Train"):
             gr.Markdown("## Dataset Creation")
             with gr.Row():
                 with gr.Column(scale=10):
-                    prefix_list = gr.Dropdown(choices=load_files_from_train_folder(), label="Truncated Outputs",
-                                              allow_custom_value=True)
+                    truncated_outputs = gr.Dropdown(choices=load_files_from_train_folder(), label="Truncated Outputs", value="None", allow_custom_value=True)
                 with gr.Column(scale=10):
-                    suffix_list = gr.Dropdown(choices=load_files_from_train_folder(), label="True Facts",
-                                              allow_custom_value=True)
+                    true_facts = gr.Dropdown(choices=load_files_from_train_folder(), label="True Facts", value="None", allow_custom_value=True)
                 with gr.Column(scale=1, min_width=50):
                     refresh_button = gr.Button("⟳", size="sm")
             with gr.Row():
@@ -456,26 +733,42 @@ with gr.Blocks(css=css) as demo:  # Remove js=js_code from here
             gr.Markdown("## Vector Training")
             with gr.Row():
                 vector_name = gr.Textbox(label="Control Vector Name")
+            with gr.Row():
+                with gr.Column(scale=10):
+                    dataset_dropdown = gr.Dropdown(
+                        choices=load_datasets_from_folder(),
+                        label="Select Dataset",
+                        value="None",
+                        allow_custom_value=True
+                    )
+                with gr.Column(scale=1, min_width=50):
+                    dataset_refresh_button = gr.Button("⟳", size="sm")
+            with gr.Row():
                 default_strength = gr.Slider(minimum=-5, maximum=5, value=0, step=0.1, label="Default Vector Strength")
             with gr.Row():
                 training_info = gr.Textbox(label="Training Info", interactive=False, scale=3)
                 train_button = gr.Button("Train", scale=1, variant="primary")
 
             make_dataset_button.click(
-                make_dataset,
-                inputs=[prefix_list, suffix_list, positive_persona, negative_persona],
+                make_dataset_ui,
+                inputs=[truncated_outputs, true_facts, positive_persona, negative_persona],
                 outputs=[dataset_info]
-            )
-
-            train_button.click(
-                train_vector,
-                inputs=[vector_name, default_strength, dataset_info],
-                outputs=[training_info]
             )
 
             refresh_button.click(
                 refresh_file_list,
-                outputs=[prefix_list, suffix_list]
+                outputs=[truncated_outputs, true_facts]
+            )
+
+            train_button.click(
+                train_vector,
+                inputs=[vector_name, dataset_dropdown, default_strength],
+                outputs=[training_info]
+            )
+
+            dataset_refresh_button.click(
+                load_datasets_from_folder,
+                outputs=[dataset_dropdown]
             )
 
 demo.queue()
