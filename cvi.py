@@ -232,6 +232,14 @@ def generate_text(prompt, max_new_tokens=512, temperature=0.9, top_p=0.95, top_k
     except Exception as e:
         log_info(f"Error in generate_text: {e}")
         return f"An error occurred: {e}"
+
+def apply_control_vector(control_model, control_vector, strength):
+    try:
+        control_model.set_control(control_vector, strength)
+    except Exception as e:
+        print(f"Error applying control vector: {e}")
+        control_model.reset()  # Reset the model if there's an error
+
 def chat(message, history, temperature, top_p, top_k, max_new_tokens, repetition_penalty):
     global model, tokenizer
 
@@ -256,6 +264,13 @@ def chat(message, history, temperature, top_p, top_k, max_new_tokens, repetition
         bot_message = f"An error occurred: {e}"
         new_history = history + [(message, bot_message)]
         return "", new_history
+
+def apply_control_vector(control_model, control_vector, strength):
+    try:
+        control_model.set_control(control_vector, strength)
+    except Exception as e:
+        print(f"Error applying control vector: {e}")
+        control_model.reset()  # Reset the model if there's an error
 
 def clear_chat():
     return []
@@ -523,10 +538,10 @@ def load_datasets_from_folder():
 
         files = ["None"] + [f for f in os.listdir(dataset_folder) if f.endswith('.json')]
         print(f"Datasets found: {files}")
-        return files
+        return {"choices": files, "__type__": "update"}
     except Exception as e:
         print(f"Error loading datasets: {e}")
-        return ["None"]
+        return {"choices": ["None"], "__type__": "update"}
 
 
 def train_vector(vector_name, dataset_file, default_strength, progress=gr.Progress()):
@@ -646,8 +661,8 @@ with gr.Blocks(css=css) as demo:
                     retry_button = gr.Button("Retry")
                     undo_button = gr.Button("Undo")
                 with gr.Column(scale=3):
-                    prompt_name = gr.Textbox(label="Prompt Name", lines=1)
                     prompts_dropdown = gr.Dropdown(choices=list(saved_prompts_dict.keys()), label="Prompt Select")
+                    prompt_name = gr.Textbox(label="Prompt Name", lines=1)
                     with gr.Row():
                         save_prompt_button = gr.Button("Save Prompt")
                         refresh_button = gr.Button("⟳", size="sm")
@@ -736,7 +751,7 @@ with gr.Blocks(css=css) as demo:
             with gr.Row():
                 with gr.Column(scale=10):
                     dataset_dropdown = gr.Dropdown(
-                        choices=load_datasets_from_folder(),
+                        choices=load_datasets_from_folder()["choices"],
                         label="Select Dataset",
                         value="None",
                         allow_custom_value=True
