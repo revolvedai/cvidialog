@@ -11,6 +11,11 @@ from pathlib import Path
 import importlib.util
 from importlib.metadata import version, PackageNotFoundError
 from packaging import version as packaging_version
+from control_vectors.create_control_vectors import main as create_control_vectors
+from control_vectors.dataset_manager import DatasetManager
+from control_vectors.hidden_state_data_manager import HiddenStateDataManager
+from control_vectors.direction_analyzer import DirectionAnalyzer
+from control_vectors.model_handler import ModelHandler
 
 # Function to install missing packages
 def install_packages():
@@ -604,7 +609,7 @@ def load_files_from_train_folder():
 
 def refresh_file_list():
     files = load_files_from_train_folder()
-    return {"choices": files, "__type__": "update"}, {"choices": files, "__type__": "update"}
+    return {"choices": files, "__type__": "update"}, {"choices": files, "__type__": "update"}, {"choices": files, "__type__": "update"}
 
 
 def load_file_content(file_name: str) -> List[str]:
@@ -616,29 +621,29 @@ def load_file_content(file_name: str) -> List[str]:
         return json.load(f)
 
 
-def make_dataset(truncated_outputs, true_facts, positive_persona, negative_persona):
+def make_dataset(prompt_stems, continuations, positive_persona, negative_persona):
     global model, user_tag, asst_tag
 
-    # Load truncated outputs and true facts
-    output_suffixes = load_file_content(truncated_outputs)
-    fact_suffixes = load_file_content(true_facts)
+    # Load prompt stems and continuations
+    prompt_stems_suffixes = load_file_content(prompt_stems)
+    continuations_suffixes = load_file_content(continuations)
 
-    # Tokenize and truncate outputs
-    truncated_output_suffixes = []
-    for s in output_suffixes:
+    # Tokenize and truncate prompt stems
+    truncated_prompt_stems = []
+    for s in prompt_stems_suffixes:
         tokens = model.tokenize(s.encode('utf-8'))
         for i in range(1, len(tokens)):
-            truncated_output_suffixes.append(model.detokenize(tokens[:i]).decode('utf-8'))
+            truncated_prompt_stems.append(model.detokenize(tokens[:i]).decode('utf-8'))
 
-    # Tokenize and truncate facts
-    truncated_fact_suffixes = []
-    for s in fact_suffixes:
+    # Tokenize and truncate continuations
+    truncated_continuations = []
+    for s in continuations_suffixes:
         tokens = model.tokenize(s.encode('utf-8'))
         for i in range(1, len(tokens) - 5):
-            truncated_fact_suffixes.append(model.detokenize(tokens[:i]).decode('utf-8'))
+            truncated_continuations.append(model.detokenize(tokens[:i]).decode('utf-8'))
 
-    # Combine truncated outputs and facts
-    all_suffixes = truncated_output_suffixes + truncated_fact_suffixes
+    # Combine truncated prompt stems and continuations
+    all_suffixes = truncated_prompt_stems + truncated_continuations
 
     # Create dataset entries
     dataset = []
@@ -775,8 +780,6 @@ def load_datasets_from_folder():
 
 
 def train_vector(vector_name, dataset_file, default_strength, progress=gr.Progress()):
-    global model, tokenizer
-
     if not vector_name:
         return "Please enter a Control Vector Name."
 
@@ -793,30 +796,65 @@ def train_vector(vector_name, dataset_file, default_strength, progress=gr.Progre
     except Exception as e:
         return f"Error loading dataset: {e}"
 
-    # Convert the loaded JSON data to DatasetEntry objects
-    dataset = [DatasetEntry(positive=entry["positive"], negative=entry["negative"])
-               for entry in dataset_json["dataset"]]
+    # Prepare temporary files for create_control_vectors_main
+    temp_dir = os.path.join(os.getcwd(), "temp")
+    os.makedirs(temp_dir, exist_ok=True)
 
-    # Reset the model before training
-    model.reset()
+    prompt_stems_file = os.path.join(temp_dir, "prompt_stems.json")
+    continuations_file = os.path.join(temp_dir, "continuations.json")
+    writing_prompts_file = os.path.join(temp_dir, "writing_prompts.txt")
 
-    # Train the control vector
+    # Prepare data for prompt_stems_file
+    prompt_stems = {
+        "pre": [""],  # Add appropriate pre-stems if needed
+        "post": [""]  # Add appropriate post-stems if needed
+    }
+    with open(prompt_stems_file, 'w') as f:
+        json.dump(prompt_stems, f)
+
+    # Prepare data for continuations_file
+    continuations = {
+        "classes": ["positive", "negative"],
+        "data": [
+            [entry["positive"] for entry in dataset_json["dataset"]],
+            [entry["negative"] for entry in dataset_json["dataset"]]
+        ]
+    }
+    with open(continuations_file, 'w') as f:
+        json.dump(continuations, f)
+
+    # Prepare data for writing_prompts_file
+    writing_prompts = [entry["positive"].split("]", 1)[-1].strip() for entry in dataset_json["dataset"]]
+    with open(writing_prompts_file, 'w') as f:
+        f.write("\n".join(writing_prompts))
+
+    # Prepare output path
+    cv_folder = os.path.join(os.getcwd(), "cv")
+    os.makedirs(cv_folder, exist_ok=True)
+    output_path = os.path.join(cv_folder, vector_name)
+
     try:
         progress(0, desc="Training Control Vector")
-        control_vector = ControlVector.train(model, tokenizer, dataset)
+        create_control_vectors_main(
+            model_id=current_model,
+            output_path=output_path,
+            prompt_stems_file_path=prompt_stems_file,
+            continuations_file_path=continuations_file,
+            writing_prompts_file_path=writing_prompts_file,
+            num_prompt_samples=len(dataset_json["dataset"]),
+            use_separate_system_message=False,
+            skip_begin_layers=0,
+            skip_end_layers=1,
+            discriminant_ratio_tolerance=0.5
+        )
         progress(1, desc="Training Complete")
     except Exception as e:
         return f"Error during training: {e}"
 
-        # Save the trained vector
-    cv_folder = os.path.join(os.getcwd(), "cv")
-    os.makedirs(cv_folder, exist_ok=True)
-    vector_path = os.path.join(cv_folder, f"{vector_name}.pt")
-
-    try:
-        save_control_vector(control_vector, vector_path)
-    except Exception as e:
-        return f"Error saving control vector: {e}"
+    # Clean up temporary files
+    os.remove(prompt_stems_file)
+    os.remove(continuations_file)
+    os.remove(writing_prompts_file)
 
     # Save metadata
     metadata_path = os.path.join(cv_folder, f"{vector_name}_metadata.json")
@@ -829,7 +867,7 @@ def train_vector(vector_name, dataset_file, default_strength, progress=gr.Progre
     with open(metadata_path, 'w') as f:
         json.dump(metadata, f, indent=2)
 
-    return f"Vector '{vector_name}' trained successfully using dataset '{dataset_file}'. Saved to {vector_path}"
+    return f"Vector '{vector_name}' trained successfully using dataset '{dataset_file}'. Saved to {output_path}"
 
 def save_control_vector(vector, path):
     with open(path, 'wb') as f:
@@ -982,9 +1020,11 @@ with gr.Blocks(css=css) as demo:
             gr.Markdown("## Dataset Creation")
             with gr.Row():
                 with gr.Column(scale=10):
-                    truncated_outputs = gr.Dropdown(choices=load_files_from_train_folder(), label="Truncated Outputs", value="None", allow_custom_value=True)
+                    prompt_stems = gr.Dropdown(choices=load_files_from_train_folder(), label="Prompt Stems", value="None", allow_custom_value=True)
                 with gr.Column(scale=10):
-                    true_facts = gr.Dropdown(choices=load_files_from_train_folder(), label="True Facts", value="None", allow_custom_value=True)
+                    continuations = gr.Dropdown(choices=load_files_from_train_folder(), label="Continuations", value="None", allow_custom_value=True)
+                with gr.Column(scale=10):
+                    creative_prompts = gr.Dropdown(choices=load_files_from_train_folder(), label="Creative Prompts", value="None", allow_custom_value=True)
                 with gr.Column(scale=1, min_width=50):
                     refresh_button = gr.Button("⟳", size="sm")
             with gr.Row():
@@ -1015,13 +1055,13 @@ with gr.Blocks(css=css) as demo:
 
             make_dataset_button.click(
                 make_dataset,
-                inputs=[truncated_outputs, true_facts, positive_persona, negative_persona],
+                inputs=[prompt_stems, continuations, creative_prompts, positive_persona, negative_persona],
                 outputs=[dataset_info]
             )
 
             refresh_button.click(
                 refresh_file_list,
-                outputs=[truncated_outputs, true_facts]
+                outputs=[prompt_stems, continuations, creative_prompts]
             )
 
             train_button.click(
