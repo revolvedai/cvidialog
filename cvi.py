@@ -2,116 +2,74 @@ import os
 import subprocess
 import warnings
 import sys
+from importlib.metadata import version, PackageNotFoundError
 from typing import List, Dict
 import logging
 from datetime import datetime
-import json
-import ctypes
-from pathlib import Path
-import importlib.util
-from importlib.metadata import version, PackageNotFoundError
-from packaging import version as packaging_version
-from control_vectors.create_control_vectors import main as create_control_vectors
-from control_vectors.dataset_manager import DatasetManager
-from control_vectors.hidden_state_data_manager import HiddenStateDataManager
-from control_vectors.direction_analyzer import DirectionAnalyzer
-from control_vectors.model_handler import ModelHandler
+
 
 # Function to install missing packages
 def install_packages():
-    required = [
-        'gradio==4.39.0',
-        'huggingface_hub>=0.14.1',
-        'repeng',
-        'requests'  # Add requests for API calls
-    ]
+    from packaging.version import parse as parse_version
+    from packaging.specifiers import SpecifierSet
+    
+    required = {
+        'gradio': '>=4.39.0',
+        'torch': '>=2.0.0',
+        'transformers': '>=4.30.0',
+        'huggingface_hub': '>=0.14.1',
+        'tokenizers': '>=0.13.3',
+        'protobuf': '>=3.20.0',
+        'sentencepiece': '>=0.1.99',
+        'accelerate': '>=0.26.0'  # Added accelerate
+    }
+    missing = []
 
-    for package in required:
-        package_name = package.split('==')[0].split('>=')[0]
-        spec = importlib.util.find_spec(package_name)
+    for package, version_constraint in required.items():
+        try:
+            installed_version = parse_version(version(package))
+            spec = SpecifierSet(version_constraint)
+            if installed_version not in spec:
+                missing.append(f"{package}{version_constraint}")
+        except PackageNotFoundError:
+            missing.append(f"{package}{version_constraint}")
 
-        if spec is None:
-            print(f"Installing {package}")
-            subprocess.check_call([sys.executable, "-m", "pip", "install", package])
-        else:
-            if '==' in package or '>=' in package:
-                try:
-                    installed_version = version(package_name)
-                    required_version = package.split('==')[-1] if '==' in package else package.split('>=')[-1]
+    if missing:
+        print(f"Installing required packages: {missing}")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", *missing])
+    else:
+        print("All required packages are already installed with compatible versions.")
 
-                    if packaging_version.parse(installed_version) < packaging_version.parse(required_version):
-                        print(f"Upgrading {package}")
-                        subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", package])
-                    else:
-                        print(f"{package_name} is already up-to-date (version {installed_version})")
-                except PackageNotFoundError:
-                    print(f"Installing {package}")
-                    subprocess.check_call([sys.executable, "-m", "pip", "install", package])
-            else:
-                print(f"{package_name} is installed")
-
+    # Install repeng from GitHub if needed
     try:
         import repeng
+        print("repeng is already installed.")
     except ImportError:
-        print("Failed to import repeng. Please check the installation.")
-
+        print("Installing repeng...")
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--upgrade", "git+https://github.com/vgel/repeng.git"])
+        print("repeng installed successfully.")
 # Install missing packages
 install_packages()
 
-import requests  # For API calls
 import gradio as gr
 import json
+import torch
+
+# Suppress flash attention warning if not compiled with it
+warnings.filterwarnings("ignore", category=UserWarning, message=".*flash attention.*")
+
+print(f"CUDA available: {torch.cuda.is_available()}")
+print(f"Current device: {torch.cuda.current_device()}")
+print(f"Device name: {torch.cuda.get_device_name(0)}")
+
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from repeng import ControlVector, ControlModel, DatasetEntry
+import pickle
 from huggingface_hub import hf_hub_download, snapshot_download
-import numpy as np
 import time
+import torch.nn.functional as F
 import random
-
-# Function to install llama.cpp from source
-def install_llama_cpp():
-    llama_cpp_dir = os.path.join(os.getcwd(), "llama.cpp")
-    if not os.path.exists(llama_cpp_dir):
-        print("Installing llama.cpp from source")
-        subprocess.check_call(["git", "clone", "https://github.com/ggerganov/llama.cpp.git", llama_cpp_dir])
-
-        os.chdir(llama_cpp_dir)
-        subprocess.check_call(["make"])
-        os.chdir("..")
-        print("llama.cpp installed successfully")
-    else:
-        print("llama.cpp installed")
-
-# Install llama.cpp
-install_llama_cpp()
-
-# Function to start the llama server
-def start_llama_server(model_file):
-    llama_server_path = os.path.join(os.getcwd(), "llama.cpp", "llama-server")
-    if not os.path.exists(llama_server_path):
-        raise FileNotFoundError(
-            f"Llama server executable not found at {llama_server_path}. Please check the installation.")
-
-    command = [llama_server_path, "-m", model_file, "--host", "127.0.0.1", "--port", "8080"]
-
-    try:
-        # Start the server process and capture its output
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        print("Llama server process started.")
-
-        # Wait a bit to allow the server to start
-        time.sleep(5)
-
-        # Check if the process is still running
-        if process.poll() is not None:
-            stdout, stderr = process.communicate()
-            print("Server process terminated. Output:")
-            print("STDOUT:", stdout)
-            print("STDERR:", stderr)
-            raise RuntimeError("Llama server process terminated unexpectedly")
-
-        return process
-    except subprocess.CalledProcessError as e:
-        print(f"Error starting llama server: {e}")
-        raise
 
 # Global variables
 model = None
@@ -120,7 +78,6 @@ user_tag = None
 asst_tag = None
 saved_prompts_dict = {}
 control_vector_options = []
-current_model = None
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 
@@ -129,249 +86,150 @@ def log_info(message):
 
 def load_config():
     with open('config.json', 'r') as f:
-        config = json.load(f)
-    if 'model_filename' not in config:
-        raise ValueError("model_filename is missing in config.json")
-    return config
+        return json.load(f)
 
 
-def is_model_downloaded(model_name, models_folder):
-    model_path = Path(models_folder) / model_name
-    return model_path.exists() and any(model_path.glob('*.bin'))
+def is_model_downloaded(model_name):
+    cache_dir = os.path.join(os.getcwd(), "model_cache", model_name)
+    return os.path.exists(cache_dir) and os.path.isdir(cache_dir) and os.listdir(cache_dir)
 
 
-def download_model(model_name, model_filename, models_folder, hf_token):
-    model_path = Path(models_folder) / model_name
-    file_path = model_path / model_filename
-    if file_path.exists():
-        print(f"Model file {model_filename} is already downloaded.")
-        return str(file_path)
+def download_model(model_name, hf_token):
+    if is_model_downloaded(model_name):
+        print(f"Model {model_name} is already downloaded.")
+        return
+    print(f"Downloading model: {model_name}")
+    cache_dir = os.path.join(os.getcwd(), "model_cache")
+    os.makedirs(cache_dir, exist_ok=True)
 
-    print(f"Downloading model file: {model_filename}")
     try:
-        downloaded_path = hf_hub_download(
+        snapshot_download(
             repo_id=model_name,
-            filename=model_filename,
             token=hf_token,
-            cache_dir=model_path,
-            resume_download=True,
+            cache_dir=cache_dir,
+            local_dir=cache_dir
         )
-        print("Model file downloaded successfully")
-        return downloaded_path
+        print("Model downloaded successfully")
     except Exception as e:
-        print(f"Error downloading model file: {e}")
+        print(f"Error downloading model: {e}")
         raise
 
 
-def get_available_models():
-    models_folder = Path('./models')
-    print(f"Searching for models in: {models_folder}")
-    if not models_folder.exists():
-        print(f"Models folder not found: {models_folder}")
-        return []
+def load_model(model_name=None):
+    global model, tokenizer, user_tag, asst_tag
 
-    models = []
-    for root, dirs, files in os.walk(models_folder):
-        for file in files:
-            if file.endswith('.gguf'):
-                relative_path = os.path.relpath(os.path.join(root, file), models_folder)
-                models.append(relative_path)
-                print(f"Found model: {relative_path}")
+    config = load_config()
+    model_name = model_name or config['model_name']
+    hf_token = config['hf_token']
 
-    if not models:
-        print("No .gguf files found in the models folder or its subfolders.")
-    else:
-        print(f"Available models: {models}")
+    print(f"Preparing to load model: {model_name}")
 
-    return models
+    # Ensure the model is downloaded
+    download_model(model_name, hf_token)
 
-def refresh_model_list():
-    models = get_available_models()
-    return gr.Dropdown(choices=models, value=current_model)
+    cache_dir = os.path.join(os.getcwd(), "model_cache")
 
-def on_model_change(model_filename, progress=gr.Progress()):
-    global current_model
-    try:
-        print(f"Attempting to change model to: {model_filename}")
-        if model_filename != current_model:
-            progress(0, desc="Starting model load")
-            load_model(model_filename, progress)
-            current_model = model_filename
-            print(f"Model successfully changed to {model_filename}")
-            progress(1, desc="Model load complete")
-        else:
-            print(f"Model {model_filename} is already loaded")
-    except Exception as e:
-        print(f"Error in on_model_change: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        progress(1, desc="Model load failed")
-        raise gr.Error(f"Failed to load model: {str(e)}")
+    # Load tokenizer
+    print("Loading tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained(model_name, token=hf_token, cache_dir=cache_dir)
+    tokenizer.pad_token_id = 0
+    print("Tokenizer loaded successfully")
 
-def load_model(model_filename=None):
-    global user_tag, asst_tag, current_model
+    # Load model
+    print("Loading model...")
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=torch.float16,
+        token=hf_token,
+        cache_dir=cache_dir,
+        device_map="auto"
+    )
+    print("Base model loaded successfully")
 
-    try:
-        print("Loading configuration")
-        config = load_config()
-        models_folder = config.get('models_folder', './models')
-        hf_token = config.get('hf_token')
+    # Wrap with ControlModel
+    print("Wrapping with ControlModel...")
+    model = ControlModel(model, list(range(-5, -18, -1)))
+    print("Model wrapped successfully")
 
-        if not hf_token:
-            raise ValueError("Hugging Face token not found in config file")
+    user_tag, asst_tag = "[INST]", "[/INST]"
 
-        if model_filename is None:
-            model_filename = config['model_filename']
+    print("Model loading complete")
+    return "Model loaded successfully"
 
-        print("Locating model file")
-        model_file = str(Path(models_folder) / model_filename)
-        print(f"Attempting to load model: {model_file}")
 
-        # Check if the model file exists, if not, download it
-        if not os.path.exists(model_file):
-            print(f"Model file not found: {model_file}")
-            print("Downloading model file...")
-            model_file = download_model(config['model_name'], model_filename, models_folder, hf_token)
-
-        print(f"Model file found. Loading model: {model_file}")
-
-        # If a model is already loaded, stop the current server
-        if 'server_process' in globals():
-            print("Stopping previous server")
-            globals()['server_process'].terminate()
-            globals()['server_process'].wait()
-
-        print("Starting llama server")
-        # Start the llama server
-        server_process = start_llama_server(model_file)
-        globals()['server_process'] = server_process
-
-        print("Waiting for server to start")
-        # Wait for the server to start and check its status
-        server_url = "http://localhost:8080/v1/models"
-        max_retries = 30
-        retry_delay = 2
-
-        for _ in range(max_retries):
-            try:
-                response = requests.get(server_url)
-                if response.status_code == 200:
-                    print("Llama server is running and ready")
-                    break
-            except requests.ConnectionError:
-                print("Waiting for llama server to start...")
-                if server_process.poll() is not None:
-                    stdout, stderr = server_process.communicate()
-                    print("Server process has terminated. Output:")
-                    print("STDOUT:", stdout)
-                    print("STDERR:", stderr)
-                    raise RuntimeError("Llama server process terminated unexpectedly")
-                time.sleep(retry_delay)
-        else:
-            raise RuntimeError("Failed to connect to llama server after multiple attempts")
-
-        user_tag, asst_tag = "[INST]", "[/INST]"
-        current_model = model_filename
-
-        print(f"Model {model_filename} loaded successfully")
-        return current_model  # Return the current model filename
-
-    except Exception as e:
-        print(f"Error in load_model: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        raise
-
-# Initialize the model on startup
 config = load_config()
-current_model = config['model_filename']
-initial_load_result = load_model()
-print(initial_load_result)
+load_model(config['model_name'])
 
-# Base URL for the llama server
-LLAMA_SERVER_URL = "http://localhost:8080/v1"
-
-def api_call(endpoint, method="POST", data=None):
-    """
-    Make an API call to the llama server.
-
-    :param endpoint: The API endpoint (e.g., "/chat/completions")
-    :param method: HTTP method (default is "POST")
-    :param data: Dictionary of data to send in the request body
-    :return: JSON response from the server
-    """
-    url = f"{LLAMA_SERVER_URL}{endpoint}"
-    headers = {"Content-Type": "application/json"}
-
-    try:
-        if method == "GET":
-            response = requests.get(url, headers=headers)
-        elif method == "POST":
-            response = requests.post(url, headers=headers, data=json.dumps(data))
-        else:
-            raise ValueError(f"Unsupported HTTP method: {method}")
-
-        response.raise_for_status()
-        return response.json()
-    except requests.RequestException as e:
-        print(f"API call failed: {e}")
-        return None
-
-
-def llama_server_generate(prompt, max_tokens=512, temperature=0.7, top_p=0.95, top_k=50, repetition_penalty=1.0):
-    """
-    Generate text using the llama server's chat completions API.
-
-    :param prompt: The input prompt for text generation
-    :param max_tokens: Maximum number of tokens to generate
-    :param temperature: Controls randomness in generation
-    :param top_p: Nucleus sampling parameter
-    :param top_k: Top-k sampling parameter
-    :param repetition_penalty: Penalty for repeating tokens
-    :return: Generated text or None if the API call fails
-    """
-    data = {
-        "model": "default",  # Assuming a default model on the server
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "top_p": top_p,
-        "top_k": top_k,
-        "repetition_penalty": repetition_penalty,
-    }
-
-    response = api_call("/chat/completions", data=data)
-
-    if response and "choices" in response:
-        return response["choices"][0]["message"]["content"]
-    else:
-        print("Failed to generate text")
-        return None
 
 def generate_text(prompt, max_new_tokens=512, temperature=0.9, top_p=0.95, top_k=50, repetition_penalty=1.0):
-    global user_tag, asst_tag
+    global model, tokenizer, user_tag, asst_tag
 
     # Parse control vectors
     clean_prompt, vectors = parse_control_vectors(prompt)
-
-    log_info(f"Chat Request. Prompt: {clean_prompt[:50]}...")  # Log first 50 chars of prompt
-
-    full_prompt = f"{user_tag} {clean_prompt} {asst_tag}"
+    
+    # Log chat request
+    log_info(f"Chat request received: {clean_prompt[:50]}...")
+    
+    # Create input prompt with instruction tags
+    input_prompt = f"{user_tag} {clean_prompt} {asst_tag}"
+    input_ids = tokenizer.encode(input_prompt, return_tensors="pt").to(model.device)
 
     try:
         if vectors:
-            # TODO: Implement control vector logic for API-based approach
-            log_info("Control vectors are not yet implemented for the API-based approach")
+            outputs = []
+            for vector_name, strength in vectors:
+                vector_path = os.path.join(os.getcwd(), "cv", f"{vector_name}.pt")
+                if not os.path.exists(vector_path):
+                    log_info(f"Control Vector {vector_name} not found")
+                    continue
 
-        # Generate text using the API
-        response = llama_server_generate(full_prompt, max_tokens=max_new_tokens, temperature=temperature,
-                                         top_p=top_p, top_k=top_k, repetition_penalty=repetition_penalty)
+                log_info(f"Applying Control Vector '{vector_name}' with strength {strength}")
+                vector = load_control_vector(vector_path)
+                if vector is None:
+                    continue
 
-        if response:
-            log_info(f"Generated response: {response[:50]}...")  # Log first 50 chars of response
-            return response
+                model.set_control(vector, strength)
+
+                with torch.no_grad():
+                    output = model.generate(
+                        input_ids,
+                        max_new_tokens=max_new_tokens,
+                        do_sample=True,
+                        temperature=temperature,
+                        top_p=top_p,
+                        top_k=top_k,
+                        repetition_penalty=repetition_penalty,
+                        pad_token_id=tokenizer.pad_token_id,
+                    )
+                outputs.append(output)
+                model.reset()
+
+            combined_output = torch.cat(outputs, dim=0)
+            generated_text = tokenizer.decode(combined_output[0], skip_special_tokens=False)
         else:
-            return "Failed to generate a response"
+            with torch.no_grad():
+                output = model.generate(
+                    input_ids,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=True,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    repetition_penalty=repetition_penalty,
+                    pad_token_id=tokenizer.pad_token_id,
+                )
+            generated_text = tokenizer.decode(output[0], skip_special_tokens=False)
+
+        # Extract only the assistant's response after the last [/INST] tag
+        response = generated_text.split(asst_tag)[-1].strip()
+        
+        # Double-check no instruction tags remain
+        response = response.replace(user_tag, "").replace(asst_tag, "").strip()
+        
+        # Log the response
+        log_info(f"Generated response: {response[:50]}...")
+        
+        return response
 
     except Exception as e:
         log_info(f"Error in generate_text: {e}")
@@ -384,82 +242,47 @@ def apply_control_vector(control_model, control_vector, strength):
         print(f"Error applying control vector: {e}")
         control_model.reset()  # Reset the model if there's an error
 
-
 def chat(message, history, temperature, top_p, top_k, max_new_tokens, repetition_penalty):
-    log_info(f"Received chat message: {message[:50]}...")  # Log first 50 chars of message
-    # Define bos_token and eos_token
-    bos_token = "<s>"
-    eos_token = "</s>"
+    global model, tokenizer
 
-    # Construct the full prompt using the mistral chat template
-    full_prompt = f"{bos_token}"
-    for i, (user_msg, bot_msg) in enumerate(history):
-        full_prompt += f"[INST] {user_msg} [/INST]"
-        if bot_msg:
-            full_prompt += f"{bot_msg}{eos_token}"
+    if model is None or tokenizer is None:
+        log_info("Model not loaded. Please load a model first.")
+        return "", history + [("Model not loaded. Please load a model first.", None)]
+
+    # Build conversation history with proper instruction tags
+    conversation = ""
+    for past_msg, past_resp in history:
+        if past_msg is not None:  # Only process valid message pairs
+            conversation += f"{user_tag} {past_msg} {asst_tag} {past_resp}\n"
     
-    full_prompt += f"[INST] {message} [/INST]"
+    # Add current message without response
+    full_prompt = f"{conversation}{message}"
 
     try:
         bot_message = generate_text(
-            full_prompt,
+            full_prompt, 
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
             repetition_penalty=repetition_penalty
         )
-
-        if bot_message:
-            log_info(f"Generated bot message: {bot_message[:50]}...")  # Log first 50 chars of bot message
-            new_history = history + [(message, bot_message)]
-            log_info("Chat response generated successfully")
-            return "", new_history
-        else:
-            log_info("Failed to generate chat response")
-            bot_message = "I'm sorry, I couldn't generate a response. Please try again."
-            new_history = history + [(message, bot_message)]
-            return "", new_history
-    except Exception as e:
-        log_info(f"Error in chat function: {e}")
-        bot_message = f"An error occurred: {e}"
+        
         new_history = history + [(message, bot_message)]
         return "", new_history
-
-def save_control_vector(vector, path):
-    # Assuming the vector is a numpy array
-    np.save(path, vector)
-    log_info(f"Saved Control Vector to {path}")
-
-def load_control_vector(path):
-    try:
-        vector = np.load(path)
-        log_info(f"Loaded Control Vector from {path}")
-        return vector
     except Exception as e:
-        log_info(f"Error loading Control Vector from {path}: {e}")
-        return None
-
-def apply_control_vector(ctx, control_vector, strength):
+        log_info(f"Error in chat function: {e}")
+        new_history = history + [(message, f"An error occurred: {e}")]
+        return "", new_history
+def apply_control_vector(control_model, control_vector, strength):
     try:
-        # Convert numpy array to ctypes array
-        c_float_p = ctypes.POINTER(ctypes.c_float)
-        vector_data = control_vector.ctypes.data_as(c_float_p)
-
-        # Assuming llama.cpp has a function to apply control vectors
-        success = llama.llama_apply_control_vector(ctx, vector_data, len(control_vector), strength)
-
-        if not success:
-            raise RuntimeError("Failed to apply control vector")
-
+        control_model.set_control(control_vector, strength)
     except Exception as e:
         print(f"Error applying control vector: {e}")
-        # Reset the model if there's an error
-        llama.llama_reset(ctx)
+        control_model.reset()  # Reset the model if there's an error
 
 def clear_chat():
     return []
-
 
 def retry(history, temperature, top_p, top_k, max_new_tokens, repetition_penalty):
     if not history:
@@ -475,15 +298,14 @@ def retry(history, temperature, top_p, top_k, max_new_tokens, repetition_penalty
             break
 
     if last_user_message is None:
-        log_info("No user message found for retry")
         return history
 
     # Keep the history up to and including the last user message
     new_history = history[:last_user_index + 1]
 
-    # Prepare the full prompt
-    full_prompt = "\n".join([f"Human: {h[0]}\nAI: {h[1]}" for h in new_history])
-    full_prompt += f"\nHuman: {last_user_message}\nAI:"
+    # Prepare the full prompt using instruction format
+    full_prompt = "\n".join([f"{user_tag} {h[0]} {asst_tag} {h[1]}" for h in new_history])
+    full_prompt += f"\n{user_tag} {last_user_message} {asst_tag}"
 
     try:
         # Generate new response
@@ -495,19 +317,13 @@ def retry(history, temperature, top_p, top_k, max_new_tokens, repetition_penalty
             top_k=top_k,
             repetition_penalty=repetition_penalty
         )
-
-        if new_response:
-            log_info(f"Generated new response for retry: {new_response[:50]}...")  # Log first 50 chars
-            new_history.append((last_user_message, new_response))
-            log_info("Retry successful")
-        else:
-            log_info("Failed to generate new response for retry")
-            new_response = "I'm sorry, I couldn't generate a new response. Please try again."
-            new_history.append((last_user_message, new_response))
+        # Append the new response to the history
+        new_history.append((last_user_message, new_response))
     except Exception as e:
-        log_info(f"Error in retry function: {e}")
-        new_response = f"An error occurred during retry: {e}"
-        new_history
+        new_response = f"An error occurred: {e}"
+        new_history.append((last_user_message, new_response))
+
+    return new_history
 
 def undo(history):
     if history:
@@ -597,9 +413,6 @@ def parse_control_vectors(input_text):
 def load_files_from_train_folder():
     train_folder = os.path.join(os.getcwd(), "train")
     try:
-        # Create the train folder if it doesn't exist
-        os.makedirs(train_folder, exist_ok=True)
-        
         files = [f for f in os.listdir(train_folder) if os.path.isfile(os.path.join(train_folder, f))]
         return ["None"] + files  # Add "None" as the first option
     except Exception as e:
@@ -609,7 +422,7 @@ def load_files_from_train_folder():
 
 def refresh_file_list():
     files = load_files_from_train_folder()
-    return {"choices": files, "__type__": "update"}, {"choices": files, "__type__": "update"}, {"choices": files, "__type__": "update"}
+    return {"choices": files, "__type__": "update"}, {"choices": files, "__type__": "update"}
 
 
 def load_file_content(file_name: str) -> List[str]:
@@ -621,29 +434,35 @@ def load_file_content(file_name: str) -> List[str]:
         return json.load(f)
 
 
-def make_dataset(prompt_stems, continuations, positive_persona, negative_persona):
-    global model, user_tag, asst_tag
+def make_dataset(
+        truncated_outputs: str,
+        true_facts: str,
+        positive_persona: str,
+        negative_persona: str,
+        user_tag: str,
+        asst_tag: str,
+        tokenizer: AutoTokenizer
+) -> Dict[str, List[Dict[str, str]]]:
+    # Load truncated outputs and true facts
+    output_suffixes = load_file_content(truncated_outputs)
+    fact_suffixes = load_file_content(true_facts)
 
-    # Load prompt stems and continuations
-    prompt_stems_suffixes = load_file_content(prompt_stems)
-    continuations_suffixes = load_file_content(continuations)
+    # Tokenize and truncate outputs
+    truncated_output_suffixes = [
+        tokenizer.convert_tokens_to_string(tokens[:i])
+        for tokens in (tokenizer.tokenize(s) for s in output_suffixes)
+        for i in range(1, len(tokens))
+    ]
 
-    # Tokenize and truncate prompt stems
-    truncated_prompt_stems = []
-    for s in prompt_stems_suffixes:
-        tokens = model.tokenize(s.encode('utf-8'))
-        for i in range(1, len(tokens)):
-            truncated_prompt_stems.append(model.detokenize(tokens[:i]).decode('utf-8'))
+    # Tokenize and truncate facts
+    truncated_fact_suffixes = [
+        tokenizer.convert_tokens_to_string(tokens[:i])
+        for tokens in (tokenizer.tokenize(s) for s in fact_suffixes)
+        for i in range(1, len(tokens) - 5)
+    ]
 
-    # Tokenize and truncate continuations
-    truncated_continuations = []
-    for s in continuations_suffixes:
-        tokens = model.tokenize(s.encode('utf-8'))
-        for i in range(1, len(tokens) - 5):
-            truncated_continuations.append(model.detokenize(tokens[:i]).decode('utf-8'))
-
-    # Combine truncated prompt stems and continuations
-    all_suffixes = truncated_prompt_stems + truncated_continuations
+    # Combine truncated outputs and facts
+    all_suffixes = truncated_output_suffixes + truncated_fact_suffixes
 
     # Create dataset entries
     dataset = []
@@ -657,6 +476,7 @@ def make_dataset(prompt_stems, continuations, positive_persona, negative_persona
 
     return {"dataset": dataset}
 
+
 def save_dataset(dataset: Dict[str, List[Dict[str, str]]], dataset_name: str):
     dataset_folder = os.path.join(os.getcwd(), "dataset")
     os.makedirs(dataset_folder, exist_ok=True)
@@ -669,80 +489,33 @@ def save_dataset(dataset: Dict[str, List[Dict[str, str]]], dataset_name: str):
 
 
 # Update the existing make_dataset function to use the new implementation
-def train_vector(vector_name, dataset_file, default_strength, progress=gr.Progress()):
-    global model
+def make_dataset_ui(truncated_outputs, true_facts, positive_persona, negative_persona):
+    global tokenizer, user_tag, asst_tag
 
-    if not vector_name:
-        return "Please enter a Control Vector Name."
+    if not all([truncated_outputs, true_facts, positive_persona, negative_persona]):
+        return "Please fill in all fields."
 
-    if dataset_file == "None":
-        return "Please select a dataset for training."
+    if truncated_outputs == "None" or true_facts == "None":
+        return "Please select valid files for Truncated Outputs and True Facts."
 
-    # Load the dataset
-    dataset_folder = os.path.join(os.getcwd(), "dataset")
-    dataset_path = os.path.join(dataset_folder, dataset_file)
+    dataset = make_dataset(
+        truncated_outputs,
+        true_facts,
+        positive_persona,
+        negative_persona,
+        user_tag,
+        asst_tag,
+        tokenizer
+    )
 
-    try:
-        with open(dataset_path, 'r') as f:
-            dataset_json = json.load(f)
-    except Exception as e:
-        return f"Error loading dataset: {e}"
+    # Generate a unique name for the dataset using the new function
+    dataset_name = generate_dataset_name(positive_persona, negative_persona)
 
-    # Convert the loaded JSON data to the format expected by llama.cpp
-    dataset = [
-        (entry["positive"], entry["negative"])
-        for entry in dataset_json["dataset"]
-    ]
+    file_path = save_dataset(dataset, dataset_name)
+    response_count = len(dataset["dataset"])
 
-    # Create a new context for training
-    params = llama.llama_context_default_params()
-    params.n_ctx = 2048
-    params.n_threads = 4
-    ctx = llama.llama_new_context_with_model(model, params)
+    return f"Dataset '{dataset_name}' created successfully with {response_count} positive/negative pairs. Saved to {file_path}"
 
-    if not ctx:
-        return "Failed to create new context for training"
-
-    # Train the control vector
-    try:
-        progress(0, desc="Training Control Vector")
-
-        # Assuming llama.cpp has a function to train control vectors
-        control_vector = (ctypes.c_float * 4096)()  # Adjust size as needed
-        success = llama.llama_train_control_vector(ctx, dataset, len(dataset), control_vector, 4096)
-
-        if not success:
-            raise RuntimeError("Control vector training failed")
-
-        progress(1, desc="Training Complete")
-    except Exception as e:
-        llama.llama_free(ctx)
-        return f"Error during training: {e}"
-
-    # Save the trained vector
-    cv_folder = os.path.join(os.getcwd(), "cv")
-    os.makedirs(cv_folder, exist_ok=True)
-    vector_path = os.path.join(cv_folder, f"{vector_name}.npy")
-
-    try:
-        save_control_vector(np.ctypeslib.as_array(control_vector), vector_path)
-    except Exception as e:
-        llama.llama_free(ctx)
-        return f"Error saving control vector: {e}"
-
-    # Save metadata
-    metadata_path = os.path.join(cv_folder, f"{vector_name}_metadata.json")
-    metadata = {
-        "name": vector_name,
-        "default_strength": default_strength,
-        "dataset": dataset_file
-    }
-
-    with open(metadata_path, 'w') as f:
-        json.dump(metadata, f, indent=2)
-
-    llama.llama_free(ctx)
-    return f"Vector '{vector_name}' trained successfully using dataset '{dataset_file}'. Saved to {vector_path}"
 
 def generate_dataset_name(positive_persona: str, negative_persona: str) -> str:
     # Clean and truncate personas to create a valid filename
@@ -780,6 +553,8 @@ def load_datasets_from_folder():
 
 
 def train_vector(vector_name, dataset_file, default_strength, progress=gr.Progress()):
+    global model, tokenizer
+
     if not vector_name:
         return "Please enter a Control Vector Name."
 
@@ -796,65 +571,30 @@ def train_vector(vector_name, dataset_file, default_strength, progress=gr.Progre
     except Exception as e:
         return f"Error loading dataset: {e}"
 
-    # Prepare temporary files for create_control_vectors_main
-    temp_dir = os.path.join(os.getcwd(), "temp")
-    os.makedirs(temp_dir, exist_ok=True)
+    # Convert the loaded JSON data to DatasetEntry objects
+    dataset = [DatasetEntry(positive=entry["positive"], negative=entry["negative"])
+               for entry in dataset_json["dataset"]]
 
-    prompt_stems_file = os.path.join(temp_dir, "prompt_stems.json")
-    continuations_file = os.path.join(temp_dir, "continuations.json")
-    writing_prompts_file = os.path.join(temp_dir, "writing_prompts.txt")
+    # Reset the model before training
+    model.reset()
 
-    # Prepare data for prompt_stems_file
-    prompt_stems = {
-        "pre": [""],  # Add appropriate pre-stems if needed
-        "post": [""]  # Add appropriate post-stems if needed
-    }
-    with open(prompt_stems_file, 'w') as f:
-        json.dump(prompt_stems, f)
-
-    # Prepare data for continuations_file
-    continuations = {
-        "classes": ["positive", "negative"],
-        "data": [
-            [entry["positive"] for entry in dataset_json["dataset"]],
-            [entry["negative"] for entry in dataset_json["dataset"]]
-        ]
-    }
-    with open(continuations_file, 'w') as f:
-        json.dump(continuations, f)
-
-    # Prepare data for writing_prompts_file
-    writing_prompts = [entry["positive"].split("]", 1)[-1].strip() for entry in dataset_json["dataset"]]
-    with open(writing_prompts_file, 'w') as f:
-        f.write("\n".join(writing_prompts))
-
-    # Prepare output path
-    cv_folder = os.path.join(os.getcwd(), "cv")
-    os.makedirs(cv_folder, exist_ok=True)
-    output_path = os.path.join(cv_folder, vector_name)
-
+    # Train the control vector
     try:
         progress(0, desc="Training Control Vector")
-        create_control_vectors_main(
-            model_id=current_model,
-            output_path=output_path,
-            prompt_stems_file_path=prompt_stems_file,
-            continuations_file_path=continuations_file,
-            writing_prompts_file_path=writing_prompts_file,
-            num_prompt_samples=len(dataset_json["dataset"]),
-            use_separate_system_message=False,
-            skip_begin_layers=0,
-            skip_end_layers=1,
-            discriminant_ratio_tolerance=0.5
-        )
+        control_vector = ControlVector.train(model, tokenizer, dataset)
         progress(1, desc="Training Complete")
     except Exception as e:
         return f"Error during training: {e}"
 
-    # Clean up temporary files
-    os.remove(prompt_stems_file)
-    os.remove(continuations_file)
-    os.remove(writing_prompts_file)
+        # Save the trained vector
+    cv_folder = os.path.join(os.getcwd(), "cv")
+    os.makedirs(cv_folder, exist_ok=True)
+    vector_path = os.path.join(cv_folder, f"{vector_name}.pt")
+
+    try:
+        save_control_vector(control_vector, vector_path)
+    except Exception as e:
+        return f"Error saving control vector: {e}"
 
     # Save metadata
     metadata_path = os.path.join(cv_folder, f"{vector_name}_metadata.json")
@@ -867,7 +607,7 @@ def train_vector(vector_name, dataset_file, default_strength, progress=gr.Progre
     with open(metadata_path, 'w') as f:
         json.dump(metadata, f, indent=2)
 
-    return f"Vector '{vector_name}' trained successfully using dataset '{dataset_file}'. Saved to {output_path}"
+    return f"Vector '{vector_name}' trained successfully using dataset '{dataset_file}'. Saved to {vector_path}"
 
 def save_control_vector(vector, path):
     with open(path, 'wb') as f:
@@ -885,6 +625,9 @@ def load_control_vector(path):
     except Exception as e:
         log_info(f"Error loading Control Vector from {path}: {e}")
         return None
+
+# Available models and other options
+model_options = ["mistralai/Mistral-7B-Instruct-v0.3", "meta-llama/Llama-2-7b-chat-hf", "ggml model (upload .bin file)"]
 
 # Custom CSS
 css = """
@@ -907,17 +650,8 @@ with gr.Blocks(css=css) as demo:
 
     with gr.Row():
         with gr.Column(scale=4):
-            available_models = get_available_models()
-            model_dropdown = gr.Dropdown(
-                choices=available_models,
-                label="Select Model",
-                value=current_model if current_model in available_models else None,
-                interactive=True,
-                allow_custom_value=True
-            )
-        with gr.Column(scale=1):
-            refresh_models_button = gr.Button("⟳", size="sm")
-            
+            model_dropdown = gr.Dropdown(choices=model_options, label="Select Model", value=model_options[0])
+
     with gr.Tabs():
         with gr.TabItem("Chat"):
             chatbot = gr.Chatbot(
@@ -966,18 +700,6 @@ with gr.Blocks(css=css) as demo:
                 with gr.Column(scale=1):
                     repetition_penalty = gr.Slider(minimum=1.0, maximum=2.0, value=1.2, step=0.05, label="Repetition penalty")
 
-            model_dropdown.change(
-                on_model_change,
-                inputs=[model_dropdown],
-                outputs=[],
-                show_progress=True
-            )
-
-            refresh_models_button.click(
-                refresh_model_list,
-                outputs=[model_dropdown]
-            )
-
             submit.click(chat, inputs=[msg, chatbot, temperature, top_p, top_k, max_new_tokens, repetition_penalty],
                          outputs=[msg, chatbot])
             msg.submit(chat, inputs=[msg, chatbot, temperature, top_p, top_k, max_new_tokens, repetition_penalty],
@@ -987,7 +709,6 @@ with gr.Blocks(css=css) as demo:
                 inputs=[chatbot, temperature, top_p, top_k, max_new_tokens, repetition_penalty],
                 outputs=[chatbot]
             )
-
             undo_button.click(undo, inputs=[chatbot], outputs=[chatbot])
             clear_button.click(clear_chat, outputs=[chatbot])
 
@@ -1020,11 +741,9 @@ with gr.Blocks(css=css) as demo:
             gr.Markdown("## Dataset Creation")
             with gr.Row():
                 with gr.Column(scale=10):
-                    prompt_stems = gr.Dropdown(choices=load_files_from_train_folder(), label="Prompt Stems", value="None", allow_custom_value=True)
+                    truncated_outputs = gr.Dropdown(choices=load_files_from_train_folder(), label="Truncated Outputs", value="None", allow_custom_value=True)
                 with gr.Column(scale=10):
-                    continuations = gr.Dropdown(choices=load_files_from_train_folder(), label="Continuations", value="None", allow_custom_value=True)
-                with gr.Column(scale=10):
-                    creative_prompts = gr.Dropdown(choices=load_files_from_train_folder(), label="Creative Prompts", value="None", allow_custom_value=True)
+                    true_facts = gr.Dropdown(choices=load_files_from_train_folder(), label="True Facts", value="None", allow_custom_value=True)
                 with gr.Column(scale=1, min_width=50):
                     refresh_button = gr.Button("⟳", size="sm")
             with gr.Row():
@@ -1054,14 +773,14 @@ with gr.Blocks(css=css) as demo:
                 train_button = gr.Button("Train", scale=1, variant="primary")
 
             make_dataset_button.click(
-                make_dataset,
-                inputs=[prompt_stems, continuations, creative_prompts, positive_persona, negative_persona],
+                make_dataset_ui,
+                inputs=[truncated_outputs, true_facts, positive_persona, negative_persona],
                 outputs=[dataset_info]
             )
 
             refresh_button.click(
                 refresh_file_list,
-                outputs=[prompt_stems, continuations, creative_prompts]
+                outputs=[truncated_outputs, true_facts]
             )
 
             train_button.click(

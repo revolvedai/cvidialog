@@ -1,4 +1,4 @@
 {
-  "model_name": "mistralai/Mistral-7B-Instruct-v0.1",
-  "hf_token": "your huggingface token here"
+  "model_name": "mistralai/Mistral-7B-Instruct-v0.3",
+  "hf_token": "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"
 }
